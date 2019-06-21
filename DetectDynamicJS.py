@@ -43,7 +43,7 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
         print "Loading..."
 
         self._callbacks = callbacks
-        self._callbacks.setExtensionName('Detect Dynamic JS')
+        self._callbacks.setExtensionName('My Detect Dynamic JS')
         self._callbacks.registerScannerCheck(self)
         self._callbacks.registerExtensionStateListener(self)
         self._helpers = callbacks.getHelpers()
@@ -56,6 +56,7 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
             "javascript", "ecmascript", "jscript", "json", "jsonp"]
 
         self.ichars = ['<', '\xff\xd8\xff\xe0', '\x89\x50\x4E\x47\x0D\x0A\x1A\x0A']
+        self.ichars_strict = ['<', '\xff\xd8\xff\xe0', '\x89\x50\x4E\x47\x0D\x0A\x1A\x0A', '{', '[']
 
         print "Loaded Detect Dynamic JS v%s (%s)!" % (VERSION, VERSIONNAME)
         return
@@ -65,6 +66,9 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
         return
 
     def doActiveScan(self, baseRequestResponse, insertionPoint):
+
+        print "doActiveScan check:", self._helpers.analyzeRequest(baseRequestResponse).getUrl()
+        
         return []
 
     def doPassiveScan(self, baseRequestResponse):
@@ -83,8 +87,8 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
             baseRequestResponse = self.switchMethod(baseRequestResponse)
             
         if (not self.isScannableRequest(baseRequestResponse) or
-            not self.isScript(baseRequestResponse) or
-            not self.containsAuthenticationCharacteristics(baseRequestResponse)):
+            not self.containsAuthenticationCharacteristics(baseRequestResponse) or
+            not self.isScript(baseRequestResponse)):
             return None
 
         newRequestResponse = self.sendUnauthenticatedRequest(baseRequestResponse)
@@ -92,20 +96,6 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
         if not issue:
             return None
 
-        # If response is script, check if script is dynamic
-        if self.isScript(newRequestResponse):
-            # sleep, in case this is a generically time stamped script
-            sleep(2)
-
-            secondAuthRequestResponse = self.sendAuthenticatedRequest(baseRequestResponse)
-            secondUnauthRequestResponse = self.sendUnauthenticatedRequest(baseRequestResponse)
-
-            isAuthDynamic = self.compareResponses(secondAuthRequestResponse, baseRequestResponse)
-            isUnauthDynamic = self.compareResponses(secondUnauthRequestResponse, newRequestResponse)
-
-            if isAuthDynamic and isUnauthDynamic:
-                issue = self.reportDynamicOnly(newRequestResponse, baseRequestResponse,
-                                               secondUnauthRequestResponse, secondAuthRequestResponse)
         scan_issues.append(issue)
         return scan_issues
 
@@ -177,7 +167,7 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
         """
         Checks for common DWR XSSI protection method
         """
-        return responseBody.startswith("throw 'allowScriptTagRemoting is false.';")
+        return responseBody.startswith("throw")
 
     def isCloseParenthesisProtected(self, responseBody):
         """
@@ -253,7 +243,7 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
             contentType = contentTypeL[0].lower()
         return any(content in contentType for content in self.possibleContentTypes)
 
-    def isScript(self, requestResponse):
+    def isScript(self, requestResponse, strict = False):
         """Determine if the response is a script"""
         try:
             response = requestResponse.getResponse()
@@ -268,9 +258,14 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
         mimeType = responseInfo.getStatedMimeType().split(';')[0]
         inferredMimeType = responseInfo.getInferredMimeType().split(';')[0]
 
-        return (not body.strip().startswith(tuple(self.ichars)) or 
-            "script" in mimeType or "script" in inferredMimeType or
-            self.hasScriptFileEnding(requestResponse) or self.hasScriptContentType(response))
+        if not strict:
+            return (not body.strip().startswith(tuple(self.ichars)) or 
+                "script" in mimeType or "script" in inferredMimeType or
+                self.hasScriptFileEnding(requestResponse) or self.hasScriptContentType(response))
+        else:
+            return (not body.strip().startswith(tuple(self.ichars_strict)) and
+                ("script" in mimeType or "script" in inferredMimeType or
+                self.hasScriptFileEnding(requestResponse) or self.hasScriptContentType(response)))
 
         # first_char = body.strip()[0:1]
         # return (first_char not in self.ichars and
@@ -295,8 +290,10 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
         oBody = oResponse.tostring()[oBodyOffset:]
         if str(nBody) == str(oBody):
             return result
-        issuename = "My Dynamic JavaScript Code Detected"
-        issuelevel = "Medium"  if (self.isProtected(newRequestResponse) or self.isProtected(oldRequestResponse)) else "High"
+        is_protected = (self.isProtected(newRequestResponse) or self.isProtected(oldRequestResponse))
+        is_strict_script = (self.isScript(newRequestResponse, strict = True) or self.isScript(oldRequestResponse, strict = True))
+        issuename = "My Dynamic JavaScript Code Detected " + ("(strict)" if is_strict_script else "(loose)")
+        issuelevel = "Medium"  if is_protected else "High"
         issuedetail = "These two files contain differing contents. Check the contents of the files to ensure that they don't contain sensitive information."
         issuebackground = "Dynamically generated JavaScript might contain session or user relevant information. Contrary to regular content that is protected by Same-Origin Policy, scripts can be included by third parties. This can lead to leakage of user/session relevant information."
         issueremediation = "Applications should not store user/session relevant data in JavaScript files with known URLs. If strict separation of data and code is not possible, CSRF tokens should be used."
@@ -308,48 +305,6 @@ class BurpExtender(IBurpExtender, IScannerCheck, IExtensionStateListener, IHttpR
                            issuename, issuelevel, issuedetail, issuebackground, issueremediation, issueconfidence,
                            [self._callbacks.applyMarkers(oldRequestResponse, None, oOffsets),
                             self._callbacks.applyMarkers(newRequestResponse, None, nOffsets)])
-        return result
-
-    def reportDynamicOnly(self, firstRequestResponse, originalRequestResponse, secondUnauthRequestResponse, secondAuthRequestResponse):
-        """Report Situation as Dynamic Only"""
-        issuename = "My Dynamic JavaScript Code Detected"
-        issuelevel = "Information"
-        issueconfidence = "Certain"
-        issuedetail = "These files contain differing contents. Check the contents of the files to ensure that they don't contain sensitive information."
-        issuebackground = "Dynamically generated JavaScript might contain session or user relevant information. Contrary to regular content that is protected by Same-Origin Policy, scripts can be included by third parties. This can lead to leakage of user/session relevant information."
-        issueremediation = "Applications should not store user/session relevant data in JavaScript files with known URLs. If strict separation of data and code is not possible, CSRF tokens should be used."
-
-        nResponse = firstRequestResponse.getResponse()
-        nResponseInfo = self._helpers.analyzeResponse(nResponse)
-        nBodyOffset = nResponseInfo.getBodyOffset()
-        nBody = nResponse.tostring()[nBodyOffset:]
-
-        oResponse = originalRequestResponse.getResponse()
-        oResponseInfo = self._helpers.analyzeResponse(oResponse)
-        oBodyOffset = oResponseInfo.getBodyOffset()
-        oBody = oResponse.tostring()[oBodyOffset:]
-
-        suResponse = secondUnauthRequestResponse.getResponse()
-        suResponseInfo = self._helpers.analyzeResponse(suResponse)
-        suBodyOffset = suResponseInfo.getBodyOffset()
-        suBody = suResponse.tostring()[suBodyOffset:]
-
-        saResponse = secondAuthRequestResponse.getResponse()
-        saResponseInfo = self._helpers.analyzeResponse(saResponse)
-        saBodyOffset = saResponseInfo.getBodyOffset()
-        saBody = saResponse.tostring()[saBodyOffset:]
-
-        oOffsets = self.calculateHighlights(nBody, oBody, oBodyOffset)
-        nOffsets = self.calculateHighlights(oBody, nBody, nBodyOffset)
-        saOffsets = self.calculateHighlights(oBody, saBody, saBodyOffset)
-        suOffsets = self.calculateHighlights(nBody, suBody, suBodyOffset)
-        result = ScanIssue(originalRequestResponse.getHttpService(),
-                           self._helpers.analyzeRequest(originalRequestResponse).getUrl(),
-                           issuename, issuelevel, issuedetail, issuebackground, issueremediation, issueconfidence,
-                           [self._callbacks.applyMarkers(originalRequestResponse, None, oOffsets),
-                            self._callbacks.applyMarkers(firstRequestResponse, None, nOffsets),
-                            self._callbacks.applyMarkers(secondUnauthRequestResponse, None, suOffsets),
-                            self._callbacks.applyMarkers(secondAuthRequestResponse, None, saOffsets)])
         return result
 
     def calculateHighlights(self, newBody, oldBody, bodyOffset):
